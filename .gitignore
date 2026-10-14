@@ -1,0 +1,9 @@
+YuanRead.xcodeproj/
+build-sim/
+build-device/
+Payload/
+*.ipa
+DerivedData/
+xcuserdata/
+*.xcuserstate
+.DS_Store

@@ -1,0 +1,137 @@
+name: ios-build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-run-on-simulator:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain info
+        run: |
+          xcodebuild -version
+          echo "--- runtimes ---"
+          xcrun simctl list runtimes
+          echo "--- devices ---"
+          xcrun simctl list devices available | head -40
+
+      - name: Probe target site from runner
+        run: |
+          {
+            echo "== curl https://lcc1107.ltd/ =="
+            curl -s -o /dev/null -w 'status=%{http_code} time=%{time_total}s remote=%{remote_ip}\n' --max-time 25 https://lcc1107.ltd/ || echo "curl root failed"
+            curl -s -o /dev/null -w 'status=%{http_code} time=%{time_total}s\n' --max-time 25 https://lcc1107.ltd/health || echo "curl health failed"
+          } 2>&1 | tee site-probe.txt
+          cat site-probe.txt
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate --spec project.yml
+          ls -la
+
+      - name: Pick an available iPhone simulator
+        id: sim
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices available | grep -E "^[[:space:]]+iPhone" | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
+          if [ -z "$UDID" ]; then echo "no iPhone simulator found"; exit 1; fi
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          xcrun simctl list devices available | grep -E "^[[:space:]]+iPhone" | head -5
+          echo "picked=$UDID"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Build for simulator
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project YuanRead.xcodeproj \
+            -scheme YuanRead \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -derivedDataPath build-sim \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build-simulator.log | tail -40
+          ls -la build-sim/Build/Products/Debug-iphonesimulator/ || true
+
+      - name: Install, launch and screenshot
+        run: |
+          set -uo pipefail
+          UDID="${{ steps.sim.outputs.udid }}"
+          APP="build-sim/Build/Products/Debug-iphonesimulator/YuanRead.app"
+          ls -la "$APP"
+
+          if ! xcrun simctl install "$UDID" "$APP"; then
+            echo "install failed, retry with ad-hoc signature"
+            codesign --force --sign - "$APP" || true
+            xcrun simctl install "$UDID" "$APP"
+          fi
+
+          xcrun simctl launch "$UDID" ltd.lcc1107.yuanread || echo "launch returned non-zero"
+          sleep 6
+          xcrun simctl io "$UDID" screenshot home-6s.png || echo "screenshot 1 failed"
+          sleep 10
+          xcrun simctl io "$UDID" screenshot home-16s.png || echo "screenshot 2 failed"
+
+          xcrun simctl spawn "$UDID" log show --last 3m --style compact \
+            --predicate 'process == "YuanRead"' > yuanread-sim.log || true
+          ls -la *.png *.log 2>/dev/null || true
+
+      - name: Upload simulator artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulator-run
+          if-no-files-found: warn
+          path: |
+            home-6s.png
+            home-16s.png
+            yuanread-sim.log
+            site-probe.txt
+            build-simulator.log
+
+      - name: Build unsigned device ipa
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project YuanRead.xcodeproj \
+            -scheme YuanRead \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build-device \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build-device.log | tail -30
+
+          APP="build-device/Build/Products/Release-iphoneos/YuanRead.app"
+          ls -la "$APP"
+          rm -rf Payload YuanRead-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry YuanRead-unsigned.ipa Payload
+          shasum -a 256 YuanRead-unsigned.ipa | tee YuanRead-unsigned.ipa.sha256
+          du -h YuanRead-unsigned.ipa
+
+      - name: Upload unsigned ipa
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yuanread-ios-unsigned-ipa
+          if-no-files-found: warn
+          path: |
+            YuanRead-unsigned.ipa
+            YuanRead-unsigned.ipa.sha256
+            build-device.log
