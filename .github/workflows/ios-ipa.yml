@@ -109,12 +109,21 @@ jobs:
           sleep 14
           xcrun simctl io "$UDID" screenshot home-night.png || echo "screenshot 3 failed"
 
-          echo "=== App 日志（壳自证的 chrome sync / themeOverride）==="
+          echo "=== App 日志（壳自证的 chrome sync）==="
           xcrun simctl spawn "$UDID" log show --last 5m --style compact \
             --predicate 'process == "YuanRead"' > yuanread-sim.log || true
-          grep "chrome sync" yuanread-sim.log | tail -5 || echo "(no chrome sync lines)"
-          grep "themeOverride" yuanread-sim.log | tail -3 || echo "(no themeOverride lines)"
-          ls -la *.png *.log 2>/dev/null || true
+          grep "chrome sync" yuanread-sim.log | tail -8 || echo "(no chrome sync lines)"
+
+          echo "=== 真闸门：paper 与 night 必须各自观察到一种页面背景色 ==="
+          grep -o "bg=rgb([^)]*)" yuanread-sim.log | sort -u > backgrounds.txt || true
+          cat backgrounds.txt
+          DISTINCT=$(wc -l < backgrounds.txt | tr -d ' ')
+          echo "distinct backgrounds = $DISTINCT"
+          if [ "$DISTINCT" -lt 2 ]; then
+            echo "::error::主题自适应验证失败：整轮只观察到 $DISTINCT 种页面背景色（期望 >= 2）—— 说明深色那轮没真正生效"
+            exit 1
+          fi
+          ls -la *.png *.log backgrounds.txt 2>/dev/null || true
 
       - name: Upload simulator artifacts
         if: always()
@@ -127,6 +136,7 @@ jobs:
             home-16s.png
             home-night.png
             yuanread-sim.log
+            backgrounds.txt
             site-probe.txt
             build-simulator.log
 

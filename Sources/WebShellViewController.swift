@@ -8,12 +8,12 @@ final class WebShellViewController: UIViewController {
 
     /// paper 主题的 --paper（styles.css 的 :root），与启动屏底色同值 ⇒ 从启动到首屏不闪白。
     private static let paperColor = UIColor(red: 248 / 255, green: 244 / 255, blue: 235 / 255, alpha: 1)
+    private static let chromeBridgeName = "yuanreadChrome"
 
     private var currentURL: URL = ServerConfig.baseURL
     private var statusBarStyle: UIStatusBarStyle = .darkContent
-    private var didApplyThemeOverride = false
 
-    /// **仅供自动化验证**：`simctl launch … -themeOverride night` 时把 body 的 data-theme 换成指定款，
+    /// **仅供自动化验证**：`simctl launch … -themeOverride night` 时把 body 的 data-theme 钉在指定款，
     /// 用来在 CI 里截「深色主题」的图。走 NSArgumentDomain（不落盘）；只放行字母数字与 - _，防注入。
     private var themeOverride: String? {
         guard let raw = UserDefaults.standard.string(forKey: "themeOverride")?
@@ -23,10 +23,18 @@ final class WebShellViewController: UIViewController {
         return raw
     }
 
-    private let webView: WKWebView = {
+    private let userContentController = WKUserContentController()
+
+    private lazy var webView: WKWebView = {
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
         config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.userContentController = self.userContentController
+        self.userContentController.add(self, name: Self.chromeBridgeName)
+        self.userContentController.addUserScript(WKUserScript(
+            source: Self.chromeBridgeScript(overrideTheme: self.themeOverride),
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true))
         let view = WKWebView(frame: .zero, configuration: config)
         view.allowsBackForwardNavigationGestures = true
         view.translatesAutoresizingMaskIntoConstraints = false
@@ -41,6 +49,10 @@ final class WebShellViewController: UIViewController {
     private var progressObservation: NSKeyValueObservation?
 
     override var preferredStatusBarStyle: UIStatusBarStyle { statusBarStyle }
+
+    deinit {
+        userContentController.removeScriptMessageHandler(forName: Self.chromeBridgeName)
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -58,7 +70,7 @@ final class WebShellViewController: UIViewController {
         webView.navigationDelegate = self
         webView.uiDelegate = self
 
-        // 禁缩放：viewporth 没写 user-scalable=no（改了会影响安卓与桌面端），所以在容器侧钳住，
+        // 禁缩放：viewport 里没写 user-scalable=no（改了会影响安卓与桌面端），所以在容器侧钳住，
         // 避免阅读时双击把正文放大。
         webView.scrollView.maximumZoomScale = 1
         webView.scrollView.minimumZoomScale = 1
@@ -171,31 +183,82 @@ final class WebShellViewController: UIViewController {
         }
     }
 
-    // MARK: - 跟随页面主题
+    // MARK: - 与页面主题联动
 
-    /// 状态栏文字色与容器底色都从**页面真实背景色**推算：
-    /// 页面切到 night/oled 时状态栏自动转白字、回弹区不再露白边；而且不必维护
-    /// 「主题名 → 颜色」的映射表（那张表迟早与 styles.css 漂移，安卓侧已有同类跨端契约的教训）。
+    /// 注入到每个页面的桥：**页面主题一变就主动告诉原生**。
+    /// 为什么不是「加载完成后读一次」：源阅的主题由前端 `applyPrefs()` 设置，而它在读完 IDB 之后才跑，
+    /// 时机晚于 `didFinish`；用户在设置页切主题更是随时发生 —— 只在 didFinish 读一次必然漏。
+    /// `overrideTheme` 非空时（仅 CI 验证用）还会**持续压制**成指定款，直到压住前端的 applyPrefs。
+    private static func chromeBridgeScript(overrideTheme: String?) -> String {
+        let value = overrideTheme.map { "'\($0)'" } ?? "''"
+        return """
+        (function () {
+          var OVERRIDE = \(value);
+          var lastBg = '';
+          function bg() { try { return getComputedStyle(document.body).backgroundColor; } catch (e) { return ''; } }
+          function notify() {
+            var cur = bg();
+            if (cur === lastBg) { return; }
+            lastBg = cur;
+            try {
+              window.webkit.messageHandlers.\(chromeBridgeName).postMessage({
+                bg: cur,
+                theme: (document.body && document.body.dataset.theme) || ''
+              });
+            } catch (e) {}
+          }
+          function enforce() {
+            if (!OVERRIDE || !document.body) { return; }
+            if (document.body.dataset.theme !== OVERRIDE) { document.body.dataset.theme = OVERRIDE; }
+            document.body.style.removeProperty('background');
+            document.body.style.removeProperty('background-color');
+            document.documentElement.style.removeProperty('--reader-bg');
+          }
+          function start() {
+            if (!document.body) { setTimeout(start, 50); return; }
+            enforce();
+            notify();
+            var observer = new MutationObserver(function () { enforce(); notify(); });
+            observer.observe(document.body, { attributes: true, attributeFilter: ['data-theme', 'style'] });
+            observer.observe(document.documentElement, { attributes: true, attributeFilter: ['style'] });
+            var rounds = 0;
+            var timer = setInterval(function () { enforce(); notify(); if (++rounds >= 20) { clearInterval(timer); } }, 200);
+          }
+          start();
+        })();
+        """
+    }
+
+    /// 状态栏文字色与容器底色都从**页面真实背景色**推算：页面切到 night/oled 时状态栏自动转白字、
+    /// 回弹区不再露白边；而且不必维护「主题名 → 颜色」映射表（那张表迟早与 styles.css 漂移）。
+    private func applyChrome(raw: String, color: UIColor, via source: String, theme: String) {
+        let luminance = Self.relativeLuminance(color)
+        let dark = luminance < 0.5
+        let style: UIStatusBarStyle = dark ? .lightContent : .darkContent
+        DispatchQueue.main.async {
+            if self.statusBarStyle != style {
+                self.statusBarStyle = style
+                self.setNeedsStatusBarAppearanceUpdate()
+            }
+            self.view.backgroundColor = color
+            self.overlay.backgroundColor = color
+            self.webView.scrollView.backgroundColor = color
+            self.webView.underPageBackgroundColor = color
+            self.applyOverlayColors(dark: dark)
+            NSLog("[YuanRead] chrome sync via=%@ bg=%@ luminance=%.3f statusBar=%@ theme=%@",
+                  source, raw, luminance, dark ? "lightContent" : "darkContent", theme)
+        }
+    }
+
     private func syncChromeFromPage() {
         webView.evaluateJavaScript("getComputedStyle(document.body).backgroundColor") { [weak self] result, error in
             guard let self = self else { return }
             guard error == nil, let raw = result as? String, let color = Self.parseCSSColor(raw) else {
-                NSLog("[YuanRead] chrome sync failed raw=%@ err=%@", String(describing: result), String(describing: error))
+                NSLog("[YuanRead] chrome probe failed raw=%@ err=%@",
+                      String(describing: result), String(describing: error))
                 return
             }
-            let luminance = Self.relativeLuminance(color)
-            let dark = luminance < 0.5
-            DispatchQueue.main.async {
-                self.statusBarStyle = dark ? .lightContent : .darkContent
-                self.setNeedsStatusBarAppearanceUpdate()
-                self.view.backgroundColor = color
-                self.overlay.backgroundColor = color
-                self.webView.scrollView.backgroundColor = color
-                self.webView.underPageBackgroundColor = color
-                self.applyOverlayColors(dark: dark)
-                NSLog("[YuanRead] chrome sync bg=%@ luminance=%.3f statusBar=%@",
-                      raw, luminance, dark ? "lightContent" : "darkContent")
-            }
+            self.applyChrome(raw: raw, color: color, via: "probe", theme: "")
         }
     }
 
@@ -215,20 +278,6 @@ final class WebShellViewController: UIViewController {
         var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
         color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
         return 0.299 * Double(red) + 0.587 * Double(green) + 0.114 * Double(blue)
-    }
-
-    private func applyThemeOverrideIfNeeded(_ completion: @escaping () -> Void) {
-        guard !didApplyThemeOverride, let theme = themeOverride else {
-            completion()
-            return
-        }
-        didApplyThemeOverride = true
-        // 源阅的主题由 CSS 变量组 body[data-theme="…"] 驱动，改这一个属性即全站换肤。
-        webView.evaluateJavaScript("document.body.dataset.theme = '\(theme)'; document.body.dataset.theme") { result, error in
-            NSLog("[YuanRead] themeOverride=%@ result=%@ err=%@",
-                  theme, String(describing: result), String(describing: error))
-            completion()
-        }
     }
 
     // MARK: - 加载
@@ -319,9 +368,7 @@ extension WebShellViewController: WKNavigationDelegate {
         refreshControl.endRefreshing()
         progressBar.isHidden = true
         hideOverlay()
-        applyThemeOverrideIfNeeded { [weak self] in
-            self?.syncChromeFromPage()
-        }
+        syncChromeFromPage()
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -347,5 +394,19 @@ extension WebShellViewController: WKUIDelegate {
             UIApplication.shared.open(url)
         }
         return nil
+    }
+}
+
+// MARK: - 页面 → 原生 的主题桥
+
+extension WebShellViewController: WKScriptMessageHandler {
+
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        guard message.name == Self.chromeBridgeName,
+              let payload = message.body as? [String: Any],
+              let raw = payload["bg"] as? String,
+              let color = Self.parseCSSColor(raw) else { return }
+        applyChrome(raw: raw, color: color, via: "bridge", theme: (payload["theme"] as? String) ?? "")
     }
 }
