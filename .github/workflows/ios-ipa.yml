@@ -53,6 +53,14 @@ jobs:
           xcrun simctl boot "$UDID" || true
           xcrun simctl bootstatus "$UDID" -b
 
+      - name: Verify app icon made it into the bundle
+        run: |
+          set -euo pipefail
+          echo "--- asset catalog sources ---"
+          find Resources/Assets.xcassets -type f | sort
+          echo "--- generated project resources ---"
+          grep -c "Assets.xcassets" YuanRead.xcodeproj/project.pbxproj || true
+
       - name: Build for simulator
         run: |
           set -euo pipefail
@@ -65,14 +73,21 @@ jobs:
             -derivedDataPath build-sim \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build 2>&1 | tee build-simulator.log | tail -40
-          ls -la build-sim/Build/Products/Debug-iphonesimulator/ || true
+          APP="build-sim/Build/Products/Debug-iphonesimulator/YuanRead.app"
+          ls -la "$APP" || true
+          echo "--- 图标是否真的打进 bundle ---"
+          ls -la "$APP/AppIcon"* "$APP/Assets.car" 2>/dev/null || echo "(no AppIcon/Assets.car)"
+          echo "--- Info.plist 关键键 ---"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :UILaunchScreen' "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :UIApplicationSceneManifest' "$APP/Info.plist" || true
 
       - name: Install, launch and screenshot
         run: |
           set -uo pipefail
           UDID="${{ steps.sim.outputs.udid }}"
+          BUNDLE=ltd.lcc1107.yuanread
           APP="build-sim/Build/Products/Debug-iphonesimulator/YuanRead.app"
-          ls -la "$APP"
 
           if ! xcrun simctl install "$UDID" "$APP"; then
             echo "install failed, retry with ad-hoc signature"
@@ -80,14 +95,25 @@ jobs:
             xcrun simctl install "$UDID" "$APP"
           fi
 
-          xcrun simctl launch "$UDID" ltd.lcc1107.yuanread || echo "launch returned non-zero"
+          echo "=== ① 默认主题（paper）==="
+          xcrun simctl launch "$UDID" "$BUNDLE" || echo "launch returned non-zero"
           sleep 6
           xcrun simctl io "$UDID" screenshot home-6s.png || echo "screenshot 1 failed"
           sleep 10
           xcrun simctl io "$UDID" screenshot home-16s.png || echo "screenshot 2 failed"
 
-          xcrun simctl spawn "$UDID" log show --last 3m --style compact \
+          echo "=== ② 深色主题（-themeOverride night）==="
+          xcrun simctl terminate "$UDID" "$BUNDLE" || true
+          sleep 2
+          xcrun simctl launch "$UDID" "$BUNDLE" -themeOverride night || echo "launch(night) returned non-zero"
+          sleep 14
+          xcrun simctl io "$UDID" screenshot home-night.png || echo "screenshot 3 failed"
+
+          echo "=== App 日志（壳自证的 chrome sync / themeOverride）==="
+          xcrun simctl spawn "$UDID" log show --last 5m --style compact \
             --predicate 'process == "YuanRead"' > yuanread-sim.log || true
+          grep "chrome sync" yuanread-sim.log | tail -5 || echo "(no chrome sync lines)"
+          grep "themeOverride" yuanread-sim.log | tail -3 || echo "(no themeOverride lines)"
           ls -la *.png *.log 2>/dev/null || true
 
       - name: Upload simulator artifacts
@@ -99,6 +125,7 @@ jobs:
           path: |
             home-6s.png
             home-16s.png
+            home-night.png
             yuanread-sim.log
             site-probe.txt
             build-simulator.log

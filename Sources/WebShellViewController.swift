@@ -2,10 +2,26 @@ import UIKit
 import WebKit
 
 /// 源阅 iOS 壳：一个 WKWebView 容器，加载同一套 Web 前端。
-/// 前端更新后 App 无需重装即生效；这里只负责容器该管的事：外链、刷新、失败兜底、地址切换。
+/// 前端更新后 App 无需重装即生效；这里只负责容器该管的事：外链、刷新、失败兜底、地址切换，
+/// 以及「跟随页面主题」的状态栏与容器底色。
 final class WebShellViewController: UIViewController {
 
+    /// paper 主题的 --paper（styles.css 的 :root），与启动屏底色同值 ⇒ 从启动到首屏不闪白。
+    private static let paperColor = UIColor(red: 248 / 255, green: 244 / 255, blue: 235 / 255, alpha: 1)
+
     private var currentURL: URL = ServerConfig.baseURL
+    private var statusBarStyle: UIStatusBarStyle = .darkContent
+    private var didApplyThemeOverride = false
+
+    /// **仅供自动化验证**：`simctl launch … -themeOverride night` 时把 body 的 data-theme 换成指定款，
+    /// 用来在 CI 里截「深色主题」的图。走 NSArgumentDomain（不落盘）；只放行字母数字与 - _，防注入。
+    private var themeOverride: String? {
+        guard let raw = UserDefaults.standard.string(forKey: "themeOverride")?
+            .trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return nil }
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+        guard raw.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
+        return raw
+    }
 
     private let webView: WKWebView = {
         let config = WKWebViewConfiguration()
@@ -24,9 +40,11 @@ final class WebShellViewController: UIViewController {
     private let overlayDetail = UILabel()
     private var progressObservation: NSKeyValueObservation?
 
+    override var preferredStatusBarStyle: UIStatusBarStyle { statusBarStyle }
+
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = .systemBackground
+        view.backgroundColor = Self.paperColor
         setupWebView()
         setupOverlay()
         setupAddressGesture()
@@ -34,24 +52,18 @@ final class WebShellViewController: UIViewController {
         loadBaseURL()
     }
 
-    /// 两指长按 1.5 秒打开地址设置 —— 刻意做得不容易误触，避免和网页手势打架。
-    private func setupAddressGesture() {
-        let press = UILongPressGestureRecognizer(target: self, action: #selector(handleAddressPress))
-        press.numberOfTouchesRequired = 2
-        press.minimumPressDuration = 1.5
-        view.addGestureRecognizer(press)
-    }
-
-    @objc private func handleAddressPress(_ gesture: UILongPressGestureRecognizer) {
-        guard gesture.state == .began else { return }
-        promptForAddress()
-    }
-
     // MARK: - 组装
 
     private func setupWebView() {
         webView.navigationDelegate = self
         webView.uiDelegate = self
+
+        // 禁缩放：viewporth 没写 user-scalable=no（改了会影响安卓与桌面端），所以在容器侧钳住，
+        // 避免阅读时双击把正文放大。
+        webView.scrollView.maximumZoomScale = 1
+        webView.scrollView.minimumZoomScale = 1
+        webView.scrollView.bouncesZoom = false
+
         view.addSubview(webView)
         NSLayoutConstraint.activate([
             webView.topAnchor.constraint(equalTo: view.topAnchor),
@@ -77,7 +89,7 @@ final class WebShellViewController: UIViewController {
 
     private func setupOverlay() {
         overlay.translatesAutoresizingMaskIntoConstraints = false
-        overlay.backgroundColor = .systemBackground
+        overlay.backgroundColor = Self.paperColor
         overlay.alpha = 0
         overlay.isHidden = true
         view.addSubview(overlay)
@@ -88,7 +100,6 @@ final class WebShellViewController: UIViewController {
         overlayTitle.numberOfLines = 0
 
         overlayDetail.font = .preferredFont(forTextStyle: .footnote)
-        overlayDetail.textColor = .secondaryLabel
         overlayDetail.textAlignment = .center
         overlayDetail.numberOfLines = 0
 
@@ -116,6 +127,18 @@ final class WebShellViewController: UIViewController {
             stack.leadingAnchor.constraint(equalTo: overlay.leadingAnchor, constant: 32),
             stack.trailingAnchor.constraint(equalTo: overlay.trailingAnchor, constant: -32)
         ])
+
+        applyOverlayColors(dark: false)
+    }
+
+    private func applyOverlayColors(dark: Bool) {
+        let ink = dark ? UIColor.white : UIColor.black
+        let link = UIColor(red: 0.88, green: 0.72, blue: 0.48, alpha: 1)
+        overlayTitle.textColor = ink
+        overlayDetail.textColor = ink.withAlphaComponent(0.7)
+        for case let button as UIButton in (overlay.subviews.first as? UIStackView)?.arrangedSubviews ?? [] {
+            button.setTitleColor(dark ? link : nil, for: .normal)
+        }
     }
 
     private func makeButton(_ title: String, action: @escaping () -> Void) -> UIButton {
@@ -126,12 +149,85 @@ final class WebShellViewController: UIViewController {
         return button
     }
 
+    /// 两指长按 1.5 秒打开地址设置 —— 刻意做得不容易误触，避免和网页手势打架。
+    private func setupAddressGesture() {
+        let press = UILongPressGestureRecognizer(target: self, action: #selector(handleAddressPress))
+        press.numberOfTouchesRequired = 2
+        press.minimumPressDuration = 1.5
+        view.addGestureRecognizer(press)
+    }
+
+    @objc private func handleAddressPress(_ gesture: UILongPressGestureRecognizer) {
+        guard gesture.state == .began else { return }
+        promptForAddress()
+    }
+
     private func observeProgress() {
         progressObservation = webView.observe(\.estimatedProgress, options: [.new]) { [weak self] view, _ in
             guard let self = self else { return }
             let value = Float(view.estimatedProgress)
             self.progressBar.isHidden = value >= 1.0
             self.progressBar.setProgress(value, animated: true)
+        }
+    }
+
+    // MARK: - 跟随页面主题
+
+    /// 状态栏文字色与容器底色都从**页面真实背景色**推算：
+    /// 页面切到 night/oled 时状态栏自动转白字、回弹区不再露白边；而且不必维护
+    /// 「主题名 → 颜色」的映射表（那张表迟早与 styles.css 漂移，安卓侧已有同类跨端契约的教训）。
+    private func syncChromeFromPage() {
+        webView.evaluateJavaScript("getComputedStyle(document.body).backgroundColor") { [weak self] result, error in
+            guard let self = self else { return }
+            guard error == nil, let raw = result as? String, let color = Self.parseCSSColor(raw) else {
+                NSLog("[YuanRead] chrome sync failed raw=%@ err=%@", String(describing: result), String(describing: error))
+                return
+            }
+            let luminance = Self.relativeLuminance(color)
+            let dark = luminance < 0.5
+            DispatchQueue.main.async {
+                self.statusBarStyle = dark ? .lightContent : .darkContent
+                self.setNeedsStatusBarAppearanceUpdate()
+                self.view.backgroundColor = color
+                self.overlay.backgroundColor = color
+                self.webView.scrollView.backgroundColor = color
+                self.webView.underPageBackgroundColor = color
+                self.applyOverlayColors(dark: dark)
+                NSLog("[YuanRead] chrome sync bg=%@ luminance=%.3f statusBar=%@",
+                      raw, luminance, dark ? "lightContent" : "darkContent")
+            }
+        }
+    }
+
+    /// 解析 `rgb(r, g, b)` / `rgba(r, g, b, a)`。
+    private static func parseCSSColor(_ raw: String) -> UIColor? {
+        let digits = raw
+            .replacingOccurrences(of: "rgba(", with: "")
+            .replacingOccurrences(of: "rgb(", with: "")
+            .replacingOccurrences(of: ")", with: "")
+        let parts = digits.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard parts.count >= 3,
+              let red = Double(parts[0]), let green = Double(parts[1]), let blue = Double(parts[2]) else { return nil }
+        return UIColor(red: CGFloat(red / 255), green: CGFloat(green / 255), blue: CGFloat(blue / 255), alpha: 1)
+    }
+
+    private static func relativeLuminance(_ color: UIColor) -> Double {
+        var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
+        color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+        return 0.299 * Double(red) + 0.587 * Double(green) + 0.114 * Double(blue)
+    }
+
+    private func applyThemeOverrideIfNeeded(_ completion: @escaping () -> Void) {
+        guard !didApplyThemeOverride, let theme = themeOverride else {
+            completion()
+            return
+        }
+        didApplyThemeOverride = true
+        // 源阅的主题由 CSS 变量组 body[data-theme="…"] 驱动，改这一个属性即全站换肤。
+        webView.evaluateJavaScript("document.body.dataset.theme = '\(theme)'; document.body.dataset.theme") { result, error in
+            NSLog("[YuanRead] themeOverride=%@ result=%@ err=%@",
+                  theme, String(describing: result), String(describing: error))
+            completion()
         }
     }
 
@@ -223,6 +319,9 @@ extension WebShellViewController: WKNavigationDelegate {
         refreshControl.endRefreshing()
         progressBar.isHidden = true
         hideOverlay()
+        applyThemeOverrideIfNeeded { [weak self] in
+            self?.syncChromeFromPage()
+        }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
