@@ -137,10 +137,33 @@ jobs:
             home-night.png
             yuanread-sim.log
             backgrounds.txt
+            uitest.log
             site-probe.txt
             build-simulator.log
 
+      - name: XCUITest 交互路径（搜索 → 详情 → 目录 → 正文）
+        run: |
+          set -uo pipefail
+          xcodebuild test \
+            -project YuanRead.xcodeproj \
+            -scheme YuanRead \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -derivedDataPath build-sim \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            -resultBundlePath uitest-result.xcresult 2>&1 | tee uitest.log | tail -80
+
+          echo "=== XCUITest 结果 ==="
+          grep -E "Test Case .*(passed|failed)|\[XCUITest\]" uitest.log | tail -10 || true
+          grep -E "error:|XCTAssert" uitest.log | tail -20 || true
+          if grep -q "\*\* TEST FAILED \*\*" uitest.log; then
+            echo "::error::XCUITest 未通过 —— 交互路径没走通（详见 artifact 里的 uitest.log）"
+            exit 1
+          fi
+
       - name: Build unsigned device ipa
+        if: always()
         run: |
           set -euo pipefail
           xcodebuild \

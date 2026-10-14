@@ -41,6 +41,45 @@ ios-app/
 | `simulator-run` | `home-6s.png` / `home-16s.png`（模拟器截图）、`yuanread-sim.log`（App 日志）、`site-probe.txt`（runner 到站点的连通性）、`build-simulator.log` |
 | `yuanread-ios-unsigned-ipa` | 未签名 ipa（真机自签用）+ sha256 |
 
+## 二·五、本地快速调试（不用等云 CI）
+
+云上一轮要 6 分钟；改壳或改前端时用这个回路，**15 秒**就能看效果 —— 用的是**真实 WebKit 引擎**（跟 iOS 上的 WKWebView 同内核）+ iPhone 视口：
+
+```bash
+# 首次需要下载引擎（约 60MB；注意 playwright 装在用户级 node_modules，项目里没有）
+node -e 'const p=require("path"),pkg=require.resolve("playwright/package.json");console.log(p.join(p.dirname(pkg),"cli.js"))'
+node <上面打印出的路径> install webkit
+
+# 开一个 iPhone 视口窗口，边点边调
+node ios-app/tools/preview-iphone.js
+node ios-app/tools/preview-iphone.js --theme=night          # 直接进夜间主题
+node ios-app/tools/preview-iphone.js --shot=x.png --headless # 只出一张图
+```
+
+它会打印页面自述（主题、`body` 背景色、viewport、DPR、UA），并把 `console` / `pageerror` / 失败请求转发到终端。
+
+## 二·六、交互路径回归（XCUITest）
+
+`UITests/YuanReadUITests.swift` 在模拟器里**真实点击**走一遍「搜索 → 详情 → 目录 → 正文 → 目录抽屉」，断言：
+
+| 断言 | 判据（实测值） |
+|---|---|
+| 搜索有结果 | `search-results:N` 且 N > 0（本机实测 54） |
+| 详情有目录 | `chapter-list:N` 且 N > 0（实测 100） |
+| 真的读到书 | `reading-content:N` 且 N > 200（实测 2979 字） |
+| 目录抽屉 | `toc-panel:N` 且 N > 0（实测 102） |
+
+它是怎么点到元素的：壳在 `-uiTestProbe 1` 时注入一段标记脚本，给关键元素打 `aria-label`（`nav-search` / `search-input` / `search-submit` / `result-first-novel` / `toc-first` / `open-toc`），并把**计数写进 label**（`search-results:54`）—— UI 测试读不到页面 JS，这样它既能精确定位，又能断言数量。生产模式下不注入，不影响正常使用。
+
+本地有 Mac 时：
+
+```bash
+xcodebuild test -project YuanRead.xcodeproj -scheme YuanRead \
+  -destination 'platform=iOS Simulator,name=iPhone 16'
+```
+
+CI 里是 `ios-build` 的第 12 步，**失败会红**（这是真闸门，不是装饰）。
+
 ## 三、装到真机（免费 Apple ID 自签）
 
 0. 手机先开 **设置 → 隐私与安全性 → 开发者模式**（iOS 16+ 必须，开了要重启一次）

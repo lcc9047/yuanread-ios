@@ -23,6 +23,11 @@ final class WebShellViewController: UIViewController {
         return raw
     }
 
+    /// XCUITest 专用开关：`simctl launch … -uiTestProbe 1` 时注入可访问性标记脚本。
+    /// 给关键元素打 aria-label，好让 UI 测试能精确点到「导航搜索 / 输入框 / 第一条小说结果 / 第一章」，
+    /// 而不是靠猜文本；同时把**关键计数写进 label**（如 `search-results:54`），UI 测试可直接断言。
+    private var uiTestProbeEnabled: Bool { UserDefaults.standard.bool(forKey: "uiTestProbe") }
+
     private let userContentController = WKUserContentController()
 
     private lazy var webView: WKWebView = {
@@ -35,6 +40,14 @@ final class WebShellViewController: UIViewController {
             source: Self.chromeBridgeScript(overrideTheme: self.themeOverride),
             injectionTime: .atDocumentEnd,
             forMainFrameOnly: true))
+        if self.uiTestProbeEnabled {
+            self.userContentController.addUserScript(WKUserScript(
+                source: Self.uiTestMarkScript,
+                injectionTime: .atDocumentEnd,
+                forMainFrameOnly: true))
+        }
+        NSLog("[YuanRead] launch args: themeOverride=%@ uiTestProbe=%@",
+              self.themeOverride ?? "(none)", self.uiTestProbeEnabled ? "1" : "0")
         let view = WKWebView(frame: .zero, configuration: config)
         view.allowsBackForwardNavigationGestures = true
         view.translatesAutoresizingMaskIntoConstraints = false
@@ -203,7 +216,8 @@ final class WebShellViewController: UIViewController {
             try {
               window.webkit.messageHandlers.\(chromeBridgeName).postMessage({
                 bg: cur,
-                theme: (document.body && document.body.dataset.theme) || ''
+                theme: (document.body && document.body.dataset.theme) || '',
+                override: OVERRIDE
               });
             } catch (e) {}
           }
@@ -221,13 +235,73 @@ final class WebShellViewController: UIViewController {
             var observer = new MutationObserver(function () { enforce(); notify(); });
             observer.observe(document.body, { attributes: true, attributeFilter: ['data-theme', 'style'] });
             observer.observe(document.documentElement, { attributes: true, attributeFilter: ['style'] });
-            var rounds = 0;
-            var timer = setInterval(function () { enforce(); notify(); if (++rounds >= 20) { clearInterval(timer); } }, 200);
+            // ⚠️ 必须**长期**压制：前端 applyPrefs() 读 IDB 之后才跑，在真机/模拟器上可能晚于 4 秒
+            //    （上一版只压 20×200ms＝4s ⇒ CI 里 night 仍被覆盖回去，主题闸门直接变红）。
+            if (OVERRIDE) { setInterval(function () { enforce(); notify(); }, 300); }
           }
           start();
         })();
         """
     }
+
+    /// XCUITest 的定位标记：给关键元素打 aria-label / role，并把**关键计数写进 label**
+    /// （如 `search-results:54`）—— UI 测试读不到页面 JS，这样它既能精确点、又能断言数量。
+    /// 选择器依据的是本地实测（`_tmp/probe-flow3.js`）：章节项是 `<button>` 不是 `<a>`；
+    /// 搜索结果卡片是 `article.book`，且**首个结果常来自影视源（🎬）**，必须跳过。
+    private static let uiTestMarkScript = """
+    (function () {
+      function set(el, key, value) {
+        if (el && el.getAttribute(key) !== value) { el.setAttribute(key, value); }
+      }
+      function firstNovelCard() {
+        var blocks = document.querySelectorAll('#search-results .search-block');
+        for (var i = 0; i < blocks.length; i++) {
+          var head = (blocks[i].querySelector('.search-block-head') || {}).textContent || '';
+          if (head.indexOf('🎬') >= 0) { continue; }
+          var card = blocks[i].querySelector('article.book');
+          if (card) { return card; }
+        }
+        return null;
+      }
+      function mark() {
+        set(document.querySelector('[data-page="search"]'), 'aria-label', 'nav-search');
+        set(document.getElementById('search-input'), 'aria-label', 'search-input');
+        set(document.getElementById('search-btn'), 'aria-label', 'search-submit');
+        set(document.getElementById('open-toc'), 'aria-label', 'open-toc');
+        var results = document.getElementById('search-results');
+        if (results) {
+          set(results, 'role', 'region');
+          set(results, 'aria-label', 'search-results:' + document.querySelectorAll('#search-results article.book').length);
+        }
+        var card = firstNovelCard();
+        if (card) { set(card, 'role', 'button'); set(card, 'aria-label', 'result-first-novel'); }
+        var chapters = document.getElementById('chapter-list');
+        if (chapters) {
+          set(chapters, 'role', 'region');
+          set(chapters, 'aria-label', 'chapter-list:' + document.querySelectorAll('#chapter-list button').length);
+        }
+        var firstChapter = document.querySelector('#chapter-list button');
+        if (firstChapter) { set(firstChapter, 'aria-label', 'toc-first'); }
+        var tocPanel = document.getElementById('toc-panel');
+        if (tocPanel) {
+          set(tocPanel, 'role', 'region');
+          set(tocPanel, 'aria-label', 'toc-panel:' + document.querySelectorAll('#toc-list button, #toc-list a').length);
+        }
+        var content = document.getElementById('reading-content');
+        if (content) {
+          set(content, 'role', 'region');
+          set(content, 'aria-label', 'reading-content:' + ((content.textContent || '').replace(/\\s/g, '').length));
+        }
+      }
+      function start() {
+        if (!document.body) { setTimeout(start, 100); return; }
+        mark();
+        new MutationObserver(mark).observe(document.body, { childList: true, subtree: true });
+        setInterval(mark, 800);
+      }
+      start();
+    })();
+    """
 
     /// 状态栏文字色与容器底色都从**页面真实背景色**推算：页面切到 night/oled 时状态栏自动转白字、
     /// 回弹区不再露白边；而且不必维护「主题名 → 颜色」映射表（那张表迟早与 styles.css 漂移）。

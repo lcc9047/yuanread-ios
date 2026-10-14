@@ -26,3 +26,31 @@ targets:
         GENERATE_INFOPLIST_FILE: "NO"
         ENABLE_USER_SCRIPT_SANDBOXING: "NO"
         ONLY_ACTIVE_ARCH: "YES"
+
+  YuanReadUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: YuanRead
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ltd.lcc1107.yuanread.uitests
+        TEST_TARGET_NAME: YuanRead
+        GENERATE_INFOPLIST_FILE: "YES"
+        SWIFT_VERSION: "5.0"
+        ONLY_ACTIVE_ARCH: "YES"
+
+schemes:
+  YuanRead:
+    build:
+      targets:
+        YuanRead: all
+        YuanReadUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - YuanReadUITests
